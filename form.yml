@@ -1,0 +1,4 @@
+cluster: slurm
+
+form:
+  - bc_num_hours

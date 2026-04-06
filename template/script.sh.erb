@@ -1,0 +1,203 @@
+#!/usr/bin/env bash
+
+#  Caddy mTLS + namespace helper functions
+
+# Accumulator for extra Caddy header_up directives.
+# Each entry is a line like: header_up X-Name value
+_CADDY_EXTRA_HEADERS=()
+
+# Add an HTTP header that Caddy will inject into requests forwarded to the
+# backend.  Call this before start_mtls_caddy.
+#
+# Usage: add_caddy_header <Header-Name> <value>
+#
+# The value may contain Caddy placeholders such as {http.request.tls.client.subject}.
+add_caddy_header() {
+  local name="$1"; shift
+  local value="$*"
+  _CADDY_EXTRA_HEADERS+=("		header_up ${name} \"${value}\"")
+}
+
+# Generate a per-job TLS server certificate signed by the configured CA.
+#
+# Usage: generate_mtls_server_cert <output_dir>
+#
+# Output variables:
+#   GENERATED_SERVER_KEY
+#   GENERATED_SERVER_CERT
+generate_mtls_server_cert() {
+  local output_dir="$1"
+
+  local mtls_key="${ONDEMAND_MTLS_KEY:-$HOME/ondemand/pki/client.key}"
+  local mtls_ca="${ONDEMAND_MTLS_CA:-$HOME/ondemand/pki/ca.crt}"
+
+  local server_key="${output_dir}/server.key"
+  local server_cert="${output_dir}/server.crt"
+  local server_csr="${output_dir}/server.csr"
+  local server_cn
+  server_cn="$(hostname -f 2>/dev/null || hostname)"
+
+  openssl ecparam -genkey -name prime256v1 -noout -out "${server_key}" 2>/dev/null
+  openssl req -new -key "${server_key}" -subj "/CN=${server_cn}" -out "${server_csr}" 2>/dev/null
+  openssl x509 -req -in "${server_csr}" \
+    -CA "${mtls_ca}" -CAkey "${mtls_key}" -CAcreateserial \
+    -days 35 -sha256 \
+    -extfile <(printf "subjectAltName=DNS:%s,DNS:%s" "${server_cn}" "$(hostname -s 2>/dev/null || echo localhost)") \
+    -out "${server_cert}" 2>/dev/null
+  rm -f "${server_csr}"
+
+  GENERATED_SERVER_KEY="${server_key}"
+  GENERATED_SERVER_CERT="${server_cert}"
+}
+
+# Start an mTLS Caddy reverse-proxy in front of a backend command, all running
+# inside a user/network namespace with slirp4netns networking.
+#
+# Usage: start_mtls_caddy <frontend_port> <backend_port> <backend_command> [args...]
+#
+# The backend command must listen on 127.0.0.1:<backend_port>.
+# All headers registered via add_caddy_header are included in the Caddyfile.
+# This function does not return until the namespace processes exit.
+start_mtls_caddy() {
+  local frontend_port="$1"; shift
+  local backend_port="$1"; shift
+  local backend_cmd=("$@")
+
+  local MTLS_CA="${ONDEMAND_MTLS_CA:-$HOME/ondemand/pki/ca.crt}"
+
+  # Build the header_up block for the Caddyfile
+  local header_lines=""
+  for h in "${_CADDY_EXTRA_HEADERS[@]}"; do
+    header_lines+="${h}"$'\n'
+  done
+
+  # ---------- Generate a per-job server certificate ----------
+  local work_dir
+  work_dir="$(dirname "${BASH_SOURCE[0]}")"
+  generate_mtls_server_cert "${work_dir}"
+  local job_server_key="${GENERATED_SERVER_KEY}"
+  local job_server_cert="${GENERATED_SERVER_CERT}"
+
+  # ---------- Generate the Caddyfile ----------
+  local caddyfile="${work_dir}/Caddyfile"
+  cat > "${caddyfile}" <<CADDYEOF
+{
+	admin off
+	persist_config off
+	auto_https off
+}
+
+:${frontend_port} {
+	tls ${job_server_cert} ${job_server_key} {
+		client_auth {
+			mode require_and_verify
+			trusted_ca_cert_file ${MTLS_CA}
+		}
+	}
+
+	reverse_proxy 127.0.0.1:${backend_port} {
+${header_lines}	}
+}
+CADDYEOF
+
+  export CADDYFILE="${caddyfile}"
+
+  # ---------- Run inside namespaces ----------
+  local myuid mygid sync_fifo api_sock
+  myuid=$(id -u)
+  mygid=$(id -g)
+  sync_fifo="/tmp/ns_sync_$$"
+  api_sock="/tmp/slirp_api_$$.sock"
+
+  _ns_cleanup() {
+    rm -f "${sync_fifo}" "${api_sock}"
+    kill 0 2>/dev/null || true
+  }
+  trap _ns_cleanup EXIT
+
+  rm -f "${sync_fifo}"
+  mkfifo "${sync_fifo}"
+
+  # Serialize the backend command into an exported variable so it
+  # survives into the namespace.
+  export _BACKEND_CMD
+  printf -v _BACKEND_CMD '%q ' "${backend_cmd[@]}"
+
+  unshare --user --net bash <<NS_SCRIPT &
+    read < "${sync_fifo}"
+    echo "[ns] Namespace configured, uid=\$(id -u) gid=\$(id -g)"
+
+    eval \${_BACKEND_CMD} &
+    BACKEND_PID=\$!
+    sleep 1
+
+    echo "[ns] Starting Caddy on port ${frontend_port}..."
+    caddy run --config "\${CADDYFILE}" --adapter caddyfile &
+    CADDY_PID=\$!
+
+    echo "[ns] Backend PID=\${BACKEND_PID}, Caddy PID=\${CADDY_PID}"
+    wait -n \${BACKEND_PID} \${CADDY_PID} 2>/dev/null || true
+    kill \${BACKEND_PID} \${CADDY_PID} 2>/dev/null || true
+    wait 2>/dev/null
+NS_SCRIPT
+  local ns_pid=$!
+  sleep 0.5
+
+  echo "[parent] Namespace child PID=${ns_pid}"
+
+  # Map real uid/gid inside the namespace
+  echo "deny" > /proc/${ns_pid}/setgroups
+  echo "${myuid} ${myuid} 1" > /proc/${ns_pid}/uid_map
+  echo "${mygid} ${mygid} 1" > /proc/${ns_pid}/gid_map
+  echo "[parent] UID/GID mapping written for PID ${ns_pid}"
+  rm -f "${api_sock}"
+  slirp4netns --configure --mtu=65520 --api-socket="${api_sock}" ${ns_pid} tap0 &
+
+  local i
+  for i in $(seq 1 20); do
+    [ -S "${api_sock}" ] && break
+    sleep 0.25
+  done
+  if [ ! -S "${api_sock}" ]; then
+    echo "[parent] ERROR: slirp4netns API socket not created" >&2
+    return 1
+  fi
+
+  echo "[parent] slirp4netns running, adding port forward..."
+  python3 -c "
+import socket, json
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect('${api_sock}')
+req = json.dumps({
+    'execute': 'add_hostfwd',
+    'arguments': {
+        'proto': 'tcp',
+        'host_addr': '0.0.0.0',
+        'host_port': ${frontend_port},
+        'guest_addr': '10.0.2.100',
+        'guest_port': ${frontend_port}
+    }
+})
+s.sendall(req.encode() + b'\n')
+resp = s.recv(4096).decode()
+print('[parent] slirp4netns port forward response:', resp)
+s.close()
+"
+
+  echo "ready" > "${sync_fifo}"
+  echo "[parent] Namespace services started, waiting..."
+  wait ${ns_pid} 2>/dev/null || true
+}
+
+#  Register headers and launch
+
+add_caddy_header X-Client-Subject "{http.request.tls.client.subject}"
+add_caddy_header X-Client-Issuer  "{http.request.tls.client.issuer}"
+add_caddy_header X-Client-Serial  "{http.request.tls.client.serial}"
+add_caddy_header X-Client-Fingerprint "{http.request.tls.client.fingerprint}"
+add_caddy_header X-Custom "Custom header example"
+
+ip addr
+
+# Start Caddy + backend in a namespace
+start_mtls_caddy "${port}" 8888 python3 "$(dirname "${BASH_SOURCE[0]}")/server.py" 8888

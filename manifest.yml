@@ -1,0 +1,9 @@
+---
+name: mTLS Header Viewer
+icon: fa://lock
+category: Interactive Apps
+subcategory: Servers
+role: batch_connect
+description: |
+  Launches a simple TLS web server on a compute node that displays all
+  HTTP request headers it receives. Connects via the PUN mTLS proxy.
